@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Liholiswano Pilot</title>
+<link rel="manifest" href="./manifest.json" />
+<meta name="theme-color" content="#1B2A4A" />
+<link rel="icon" href="./icon-192.png" />
+<link rel="apple-touch-icon" href="./icon-192.png" />
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<style>
+  body { margin: 0; background: #FAF7F0; font-family: 'Segoe UI', system-ui, sans-serif; color: #1B2A4A; }
+  * { box-sizing: border-box; }
+  button { cursor: pointer; font-family: inherit; }
+  input, select { font-family: inherit; }
+  table { border-collapse: collapse; }
+</style>
+</head>
+<body>
+<div id="root">
+  <div style="max-width:480px;margin:60px auto;padding:20px;font-family:system-ui,sans-serif;color:#5B6472;text-align:center;">
+    Loading… if this message doesn't disappear within a few seconds, your connection likely can't reach
+    <code>cdnjs.cloudflare.com</code> (needed to load React) — try a different network, or open this page's browser
+    console (F12) to see the exact error.
+  </div>
+</div>
+<script>
+  // If nothing has replaced the fallback message above within 8s, the app failed to mount.
+  setTimeout(function () {
+    var root = document.getElementById("root");
+    if (root && root.children.length === 1 && root.firstElementChild.textContent.indexOf("Loading") === 0) {
+      root.innerHTML =
+        '<div style="max-width:480px;margin:60px auto;padding:20px;font-family:system-ui,sans-serif;color:#B4432D;text-align:center;">' +
+        "This page didn't load fully. Most likely your network is blocking cdnjs.cloudflare.com (needed for React/Babel), " +
+        "or you're viewing this as a local file instead of the live GitHub Pages link. " +
+        "Open the browser console (F12 → Console) for the exact error.</div>";
+    }
+  }, 8000);
+</script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback } = React;
+
+/* ---- SET THIS to your deployed Apps Script Web App URL ---- */
+const API_URL = "https://script.google.com/macros/s/AKfycbx8OowtHpe50vz1ZnRS1gRCZKZmzHuTZlkedDg06GnJxo9ZW_A56EhC2JlUs2rWfKEQOQ/exec";
+
+const DEFAULT_CONFIG = {
+  groupName: "Liholiswano",
+  currency: "E",
+  n: 10,
+  c: 1.0,
+  flatCollateral: 10.0,
+  reserveSkimPct: 10,
+  cadenceDays: 7,
+};
+
+// Bidding decay preview — NOT active yet (informational only).
+function maxDiscountPct(daysElapsedInCycle, cadenceDays, ceiling = 20, floor = 5, roundsToFloor = 6) {
+  const dropPerRound = (ceiling - floor) / roundsToFloor;
+  const dropPerDay = dropPerRound / cadenceDays;
+  const pct = ceiling - dropPerDay * daysElapsedInCycle;
+  return Math.max(floor, Math.round(pct * 10) / 10);
+}
+
+function money(v, currency) {
+  return `${currency}${Number(v).toFixed(2)}`;
+}
+
+function emptyState() {
+  return { config: DEFAULT_CONFIG, members: [], round: 1, reserve: 0, log: [], waitlist: [], bids: [] };
+}
+
+function collateralFor(slot, n, c, flatCollateral) {
+  return flatCollateral;
+}
+
+function owedAfterPayout(slot, n, c) {
+  const remaining = Math.max(n - slot, 0);
+  return Math.round(remaining * c * 100) / 100;
+}
+
+async function loadState() {
+  try {
+    const res = await fetch(API_URL);
+    const data = await res.json();
+    return data || emptyState();
+  } catch {
+    return emptyState();
+  }
+}
+
+async function saveState(next) {
+  try {
+    // text/plain avoids a CORS preflight OPTIONS request, which Apps Script doesn't handle.
+    const res = await fetch(API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify(next),
+    });
+    const data = await res.json();
+    return !!data.ok;
+  } catch {
+    return false;
+  }
+}
+
+function App() {
+  const [state, setState] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [saveError, setSaveError] = useState(false);
+  const [nameInput, setNameInput] = useState("");
+  const [phoneInput, setPhoneInput] = useState("");
+  const [confirmReset, setConfirmReset] = useState(false);
+
+  useEffect(() => {
+    loadState().then((s) => { setState(s); setLoading(false); });
+  }, []);
+
+  const persist = useCallback(async (next) => {
+    setState(next);
+    const ok = await saveState(next);
+    setSaveError(!ok);
+  }, []);
+
+  if (loading || !state) {
+    return <div style={{ padding: 32, textAlign: "center", color: "#5B6472" }}>Loading pilot group…</div>;
+  }
+
+  const { config, members, round, reserve, log, waitlist, bids } = state;
+  const { n, c, currency, reserveSkimPct, flatCollateral } = config;
+  const groupFull = members.length >= n;
+  const activeCount = members.filter((m) => !m.defaulted).length || n;
+  const pot = activeCount * c;
+  const reserveSkim = Math.round(c * (reserveSkimPct / 100) * 100) / 100;
+  const perRoundDue = Math.round((c + reserveSkim) * 100) / 100;
+
+  const addLog = (entries, text, tone = "neutral") => [...entries, { round, text, tone, ts: Date.now() }];
+
+  function addMember() {
+    if (!nameInput.trim() || groupFull) return;
+    const slot = members.length + 1;
+    const req = collateralFor(slot, n, c, flatCollateral);
+    const newMember = {
+      id: crypto.randomUUID(), name: nameInput.trim(), phone: phoneInput.trim(), slot,
+      collateralRequired: req, collateralPosted: false, paidThisRound: false,
+      completedCycles: 0, defaulted: false, totalPaidIn: 0, bonusCredit: 0,
+    };
+    persist({ ...state, members: [...members, newMember],
+      log: addLog(log, `${newMember.name} joined at slot ${slot} — collateral required: ${money(req, currency)}`) });
+    setNameInput(""); setPhoneInput("");
+  }
+
+  function toggleCollateral(id) {
+    const m = members.find((x) => x.id === id);
+    persist({ ...state,
+      members: members.map((x) => x.id === id ? { ...x, collateralPosted: !x.collateralPosted } : x),
+      log: addLog(log, `${m.name}'s collateral marked ${!m.collateralPosted ? "posted" : "not posted"} (${money(m.collateralRequired, currency)})`) });
+  }
+
+  function markPaid(id) {
+    const m = members.find((x) => x.id === id);
+    if (!m || m.paidThisRound || m.defaulted) return;
+    persist({ ...state,
+      members: members.map((x) => x.id === id ? { ...x, paidThisRound: true, totalPaidIn: x.totalPaidIn + perRoundDue } : x),
+      reserve: Math.round((reserve + reserveSkim) * 100) / 100,
+      log: addLog(log, `${m.name} paid round ${round}: ${money(perRoundDue, currency)} (${money(c, currency)} contribution + ${money(reserveSkim, currency)} reserve)`, "good") });
+  }
+
+  function markDefault(id) {
+    const m = members.find((x) => x.id === id);
+    if (!m) return;
+    const owedAfter = owedAfterPayout(m.slot, n, c);
+    const collateralValue = m.collateralPosted ? m.collateralRequired : 0;
+    const shortfall = Math.round((owedAfter - collateralValue) * 100) / 100;
+    const reserveUsed = Math.min(Math.max(shortfall, 0), reserve);
+    const stillShort = Math.round((shortfall - reserveUsed) * 100) / 100;
+    persist({ ...state,
+      members: members.map((x) => x.id === id ? { ...x, defaulted: true, paidThisRound: false } : x),
+      reserve: Math.round((reserve - reserveUsed) * 100) / 100,
+      log: addLog(log, `${m.name} DEFAULTED at round ${round}. Collateral seized: ${money(collateralValue, currency)}. Reserve covered: ${money(reserveUsed, currency)}.${stillShort > 0 ? ` Uncovered shortfall: ${money(stillShort, currency)} — absorb from next pot or extend cycle.` : ""}`, "bad") });
+  }
+
+  function addWaitlist() {
+    if (!nameInput.trim()) return;
+    persist({ ...state,
+      waitlist: [...waitlist, { id: crypto.randomUUID(), name: nameInput.trim(), phone: phoneInput.trim() }],
+      log: addLog(log, `${nameInput.trim()} added to the waiting list`) });
+    setNameInput(""); setPhoneInput("");
+  }
+
+  function promoteReplacement(waitId, defaultedId) {
+    const wm = waitlist.find((w) => w.id === waitId);
+    const dm = members.find((m) => m.id === defaultedId);
+    if (!wm || !dm) return;
+    const lastSlot = Math.max(...members.map((m) => m.slot)) + 1;
+    const newMember = {
+      id: crypto.randomUUID(), name: wm.name, phone: wm.phone, slot: lastSlot,
+      collateralRequired: collateralFor(lastSlot, n, c, flatCollateral), collateralPosted: false, paidThisRound: false,
+      completedCycles: 0, defaulted: false, totalPaidIn: 0, bonusCredit: 0, replaced: dm.name,
+    };
+    persist({ ...state,
+      members: [...members.filter((m) => m.id !== defaultedId), newMember],
+      waitlist: waitlist.filter((w) => w.id !== waitId),
+      log: addLog(log, `${wm.name} replaces ${dm.name}, takes remaining rounds, assigned last open slot (#${lastSlot})`) });
+  }
+
+  const dueThisRound = members.filter((m) => !m.defaulted);
+  const allPaid = dueThisRound.length > 0 && dueThisRound.every((m) => m.paidThisRound);
+  const scheduledRecipient = members.find((m) => m.slot === round && !m.defaulted);
+  const daysElapsed = (round - 1) * (config.cadenceDays || 7);
+  const currentMaxDiscount = maxDiscountPct(daysElapsed, config.cadenceDays || 7);
+  const winningBid = bids.length
+    ? bids.reduce((best, b) => (b.discountPct > best.discountPct ? b : best), bids[0])
+    : null;
+  const recipient = winningBid ? members.find((m) => m.id === winningBid.memberId) : scheduledRecipient;
+
+  function placeBid(memberId, discountPct) {
+    const pct = Math.max(2, Math.min(currentMaxDiscount, Number(discountPct) || 0));
+    const m = members.find((x) => x.id === memberId);
+    if (!m || m.slot === round) return;
+    const others = bids.filter((b) => b.memberId !== memberId);
+    persist({ ...state, bids: [...others, { memberId, name: m.name, discountPct: pct }],
+      log: addLog(log, `${m.name} bid ${pct}% to take round ${round} early`) });
+  }
+
+  function withdrawBid(memberId) {
+    const m = members.find((x) => x.id === memberId);
+    persist({ ...state, bids: bids.filter((b) => b.memberId !== memberId),
+      log: addLog(log, `${m ? m.name : "A member"} withdrew their bid`) });
+  }
+
+  function releasePayout() {
+    if (!allPaid || !recipient) return;
+
+    if (winningBid && scheduledRecipient && recipient.id !== scheduledRecipient.id) {
+      const discountAmount = Math.round((pot * winningBid.discountPct / 100) * 100) / 100;
+      const winnerBonus = recipient.bonusCredit || 0;
+      const winnerNet = Math.round((pot - discountAmount - c + winnerBonus) * 100) / 100;
+      const others = members.filter((m) => m.id !== recipient.id && !m.defaulted);
+      const share = others.length ? Math.round((discountAmount / others.length) * 100) / 100 : 0;
+
+      const nextMembers = members.map((m) => {
+        if (m.id === recipient.id) {
+          return { ...m, slot: scheduledRecipient.slot, completedCycles: m.completedCycles + 1, paidThisRound: false, bonusCredit: 0 };
+        }
+        if (m.id === scheduledRecipient.id) {
+          return { ...m, slot: recipient.slot, paidThisRound: false, bonusCredit: Math.round((m.bonusCredit + share) * 100) / 100 };
+        }
+        return { ...m, paidThisRound: false, bonusCredit: Math.round((m.bonusCredit + share) * 100) / 100 };
+      });
+
+      persist({ ...state, members: nextMembers, round: round + 1, bids: [],
+        log: addLog(log, `Round ${round}: ${recipient.name} won the bid (gave up ${winningBid.discountPct}% = ${money(discountAmount, currency)}), net gain ${money(winnerNet, currency)}. ${scheduledRecipient.name} moves to slot ${recipient.slot}. Bonus of ${money(share, currency)} credited to the other ${others.length} members.`, "good") });
+      return;
+    }
+
+    const recipientBonus = recipient.bonusCredit || 0;
+    const net = Math.round((pot - c + recipientBonus) * 100) / 100;
+    persist({ ...state,
+      members: members.map((m) => m.id === recipient.id
+        ? { ...m, completedCycles: m.completedCycles + 1, paidThisRound: false, bonusCredit: 0 }
+        : { ...m, paidThisRound: false }),
+      round: round + 1,
+      bids: [],
+      log: addLog(log, `Round ${round} payout released to ${recipient.name}: ${money(pot, currency)} pot, net gain ${money(net, currency)}`, "good") });
+  }
+
+  function doReset() { persist(emptyState()); setConfirmReset(false); }
+
+  const totalCollateralLocked = members.reduce((sum, m) => sum + (m.collateralPosted ? m.collateralRequired : 0), 0);
+  const completedCount = members.filter((m) => m.slot < round && !m.defaulted).length;
+
+  return (
+    <div style={{ maxWidth: 760, margin: "0 auto", padding: "24px 20px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", borderBottom: "1px solid #E4DFD3", paddingBottom: 16, marginBottom: 20 }}>
+        <div>
+          <h1 style={{ fontFamily: "Georgia, serif", fontSize: 24, margin: 0 }}>{config.groupName}</h1>
+          <p style={{ fontSize: 13, color: "#5B6472", margin: "4px 0 0" }}>
+            {money(c, currency)} per round · {n} members · round {round} of {n}
+          </p>
+        </div>
+        <button onClick={() => setConfirmReset(true)}
+          style={{ fontSize: 12, padding: "4px 8px", borderRadius: 4, border: "1px solid #E4DFD3", background: "transparent", color: "#5B6472" }}>
+          ↻ Reset pilot
+        </button>
+      </div>
+
+      {confirmReset && (
+        <div style={{ marginBottom: 20, padding: 12, borderRadius: 6, border: "1px solid #B4432D", background: "#FBEAE5", fontSize: 14 }}>
+          <p style={{ margin: "0 0 8px" }}>This clears every member, round, and log entry. It cannot be undone.</p>
+          <button onClick={doReset} style={{ padding: "4px 12px", borderRadius: 4, background: "#B4432D", color: "#fff", border: "none", fontSize: 12, marginRight: 8 }}>Yes, clear everything</button>
+          <button onClick={() => setConfirmReset(false)} style={{ padding: "4px 12px", borderRadius: 4, border: "1px solid #E4DFD3", background: "transparent", fontSize: 12 }}>Cancel</button>
+        </div>
+      )}
+
+      {saveError && (
+        <div style={{ marginBottom: 20, padding: 10, borderRadius: 6, border: "1px solid #B4432D", background: "#FBEAE5", color: "#B4432D", fontSize: 14 }}>
+          ⚠ Last change didn't save — check the API_URL is set and try again.
+        </div>
+      )}
+
+      <p style={{ fontSize: 12, padding: "8px 12px", borderRadius: 4, background: "#F0EBDD", color: "#5B6472", marginBottom: 24 }}>
+        This group's data is shared — anyone with the site link can see and update it. Use it only with people who already know they're in the group.
+      </p>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 24 }}>
+        <StatCard label="Members" value={`${members.length} / ${n}`} />
+        <StatCard label="Reserve fund" value={money(reserve, currency)} />
+        <StatCard label="Cycles completed" value={completedCount} />
+      </div>
+
+      {!groupFull ? (
+        <JoinPanel {...{ n, c, currency, members, nameInput, phoneInput, setNameInput, setPhoneInput, addMember, toggleCollateral }} />
+      ) : (
+        <React.Fragment>
+          <RoundPanel {...{ round, n, currency, perRoundDue, reserveSkim, pot, cadenceDays: config.cadenceDays, currentMaxDiscount, bids, winningBid, scheduledRecipient, placeBid, withdrawBid, members: dueThisRound, recipient, allPaid, markPaid, markDefault, releasePayout, totalCollateralLocked }} />
+          <WaitlistPanel {...{ waitlist, defaulted: members.filter((m) => m.defaulted), nameInput, phoneInput, setNameInput, setPhoneInput, addWaitlist, promote: promoteReplacement }} />
+          <RosterTable members={members} currency={currency} />
+        </React.Fragment>
+      )}
+
+      <LedgerLog log={log} />
+    </div>
+  );
+}
+
+function StatCard({ label, value }) {
+  return (
+    <div style={{ border: "1px solid #E4DFD3", borderRadius: 6, padding: 12, background: "#fff" }}>
+      <div style={{ fontSize: 12, color: "#5B6472", marginBottom: 4 }}>{label}</div>
+      <div style={{ fontFamily: "Georgia, serif", fontSize: 18 }}>{value}</div>
+    </div>
+  );
+}
+
+function JoinPanel({ n, members, nameInput, phoneInput, setNameInput, setPhoneInput, addMember, toggleCollateral, currency }) {
+  return (
+    <div style={{ border: "1px solid #E4DFD3", borderRadius: 6, padding: 16, marginBottom: 24, background: "#fff" }}>
+      <h2 style={{ fontFamily: "Georgia, serif", fontSize: 18, margin: "0 0 4px" }}>Fill the group</h2>
+      <p style={{ fontSize: 14, color: "#5B6472", margin: "0 0 16px" }}>
+        {members.length} of {n} joined. Each new member is assigned the next payout slot in order and must post collateral before the group can go active.
+      </p>
+      <div style={{ display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap" }}>
+        <input value={nameInput} onChange={(e) => setNameInput(e.target.value)} placeholder="Member name"
+          style={{ flex: 1, minWidth: 140, border: "1px solid #E4DFD3", borderRadius: 4, padding: "8px 10px", fontSize: 14 }} />
+        <input value={phoneInput} onChange={(e) => setPhoneInput(e.target.value)} placeholder="Phone (optional)"
+          style={{ flex: 1, minWidth: 140, border: "1px solid #E4DFD3", borderRadius: 4, padding: "8px 10px", fontSize: 14 }} />
+        <button onClick={addMember} disabled={!nameInput.trim()}
+          style={{ padding: "8px 16px", borderRadius: 4, background: "#1B2A4A", color: "#fff", border: "none", fontSize: 14, opacity: nameInput.trim() ? 1 : 0.4 }}>
+          + Add
+        </button>
+      </div>
+      {members.length === 0 ? (
+        <p style={{ fontSize: 14, fontStyle: "italic", color: "#5B6472" }}>No members yet — add the first one to start the pilot.</p>
+      ) : (
+        members.map((m) => (
+          <div key={m.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderTop: "1px solid #F0EBDD", fontSize: 14 }}>
+            <span>Slot {m.slot} — {m.name} <span style={{ color: "#5B6472" }}>collateral due: {money(m.collateralRequired, currency)}</span></span>
+            <button onClick={() => toggleCollateral(m.id)}
+              style={{ padding: "4px 8px", borderRadius: 4, border: `1px solid ${m.collateralPosted ? "#3F7D58" : "#E4DFD3"}`, background: "transparent", color: m.collateralPosted ? "#3F7D58" : "#5B6472", fontSize: 12 }}>
+              {m.collateralPosted ? "✓ Collateral posted" : "Mark posted"}
+            </button>
+          </div>
+        ))
+      )}
+    </div>
+  );
+}
+
+function RoundPanel({ round, n, currency, perRoundDue, reserveSkim, pot, cadenceDays, currentMaxDiscount, bids, winningBid, scheduledRecipient, placeBid, withdrawBid, members, recipient, allPaid, markPaid, markDefault, releasePayout, totalCollateralLocked }) {
+  const paidCount = members.filter((m) => m.paidThisRound).length;
+  const [bidInputs, setBidInputs] = useState({});
+  const eligibleBidders = members.filter((m) => m.slot !== round);
+
+  return (
+    <div style={{ border: "1px solid #E4DFD3", borderRadius: 6, padding: 16, marginBottom: 24, background: "#fff" }}>
+      <div style={{ display: "flex", justifyContent: "space-between" }}>
+        <h2 style={{ fontFamily: "Georgia, serif", fontSize: 18, margin: 0 }}>Round {round}</h2>
+        <span style={{ fontSize: 12, color: "#5B6472" }}>{paidCount} / {members.length} paid</span>
+      </div>
+      <p style={{ fontSize: 14, color: "#5B6472", margin: "8px 0 16px" }}>
+        Each active member owes {money(perRoundDue, currency)} this round ({money(pot / members.length, currency)} contribution + {money(reserveSkim, currency)} to the shared reserve).
+        Pot this round: {money(pot, currency)}.{recipient ? ` ${recipient.name} is due to receive it${winningBid ? " (won by bid)" : ""}.` : " No one is scheduled — check the roster."}
+      </p>
+      <div style={{ height: 6, borderRadius: 3, background: "#E4DFD3", marginBottom: 16 }}>
+        <div style={{ height: 6, borderRadius: 3, background: "#3F7D58", width: `${(paidCount / Math.max(members.length, 1)) * 100}%` }} />
+      </div>
+      {members.map((m) => (
+        <div key={m.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderTop: "1px solid #F0EBDD", fontSize: 14 }}>
+          <span>Slot {m.slot} — {m.name}
+            {m.slot === round && <span style={{ color: "#C98A2C" }}> (scheduled)</span>}
+            {winningBid && winningBid.memberId === m.id && <span style={{ color: "#C98A2C" }}> (winning bid)</span>}
+          </span>
+          <span style={{ display: "flex", gap: 8 }}>
+            <button onClick={() => markPaid(m.id)} disabled={m.paidThisRound}
+              style={{ padding: "4px 8px", borderRadius: 4, border: "1px solid #3F7D58", color: "#3F7D58", background: "transparent", fontSize: 12, opacity: m.paidThisRound ? 0.4 : 1 }}>
+              {m.paidThisRound ? "Paid" : "Mark paid"}
+            </button>
+            <button onClick={() => markDefault(m.id)}
+              style={{ padding: "4px 8px", borderRadius: 4, border: "1px solid #B4432D", color: "#B4432D", background: "transparent", fontSize: 12 }}>
+              Mark default
+            </button>
+          </span>
+        </div>
+      ))}
+      <button onClick={releasePayout} disabled={!allPaid}
+        style={{ width: "100%", padding: "10px", borderRadius: 4, background: "#C98A2C", color: "#fff", border: "none", fontSize: 14, marginTop: 16, opacity: allPaid ? 1 : 0.4 }}>
+        Release round {round} payout →
+      </button>
+      <p style={{ fontSize: 12, color: "#5B6472", marginTop: 8 }}>Total collateral currently locked: {money(totalCollateralLocked, currency)}</p>
+
+      <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid #E4DFD3" }}>
+        <h3 style={{ fontFamily: "Georgia, serif", fontSize: 14, margin: "0 0 4px" }}>Bid to take this round early</h3>
+        <p style={{ fontSize: 12, color: "#5B6472", margin: "0 0 12px" }}>
+          Members not yet scheduled can offer up to <strong>{currentMaxDiscount}%</strong> of the pot to jump the queue. Highest offer wins when the payout is released; the discount splits as a bonus among everyone else.
+        </p>
+        {eligibleBidders.length === 0 ? (
+          <p style={{ fontSize: 12, fontStyle: "italic", color: "#5B6472" }}>No one is eligible to bid this round.</p>
+        ) : (
+          <div style={{ marginBottom: 12 }}>
+            {eligibleBidders.map((m) => {
+              const existing = bids.find((b) => b.memberId === m.id);
+              return (
+                <div key={m.id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 14, padding: "4px 0" }}>
+                  <span style={{ flex: 1 }}>Slot {m.slot} — {m.name}</span>
+                  {existing ? (
+                    <>
+                      <span style={{ color: "#C98A2C" }}>bid {existing.discountPct}%</span>
+                      <button onClick={() => withdrawBid(m.id)}
+                        style={{ padding: "2px 8px", borderRadius: 4, border: "1px solid #B4432D", color: "#B4432D", background: "transparent", fontSize: 12 }}>
+                        Withdraw
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <input type="number" min={2} max={currentMaxDiscount} step={0.5}
+                        placeholder={`2–${currentMaxDiscount}%`}
+                        value={bidInputs[m.id] || ""}
+                        onChange={(e) => setBidInputs({ ...bidInputs, [m.id]: e.target.value })}
+                        style={{ width: 70, border: "1px solid #E4DFD3", borderRadius: 4, padding: "4px 6px", fontSize: 12 }} />
+                      <button onClick={() => placeBid(m.id, bidInputs[m.id])} disabled={!bidInputs[m.id]}
+                        style={{ padding: "4px 8px", borderRadius: 4, border: "1px solid #1B2A4A", background: "transparent", fontSize: 12, opacity: bidInputs[m.id] ? 1 : 0.4 }}>
+                        Place bid
+                      </button>
+                    </>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+        {winningBid && (
+          <p style={{ fontSize: 12, background: "#F0EBDD", color: "#5B6472", padding: "6px 8px", borderRadius: 4 }}>
+            Current winning bid: <strong>{winningBid.name}</strong> at {winningBid.discountPct}% — will take slot {round} instead of {scheduledRecipient ? scheduledRecipient.name : "the scheduled member"} when payout is released.
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function WaitlistPanel({ waitlist, defaulted, nameInput, phoneInput, setNameInput, setPhoneInput, addWaitlist, promote }) {
+  return (
+    <div style={{ border: "1px solid #E4DFD3", borderRadius: 6, padding: 16, marginBottom: 24, background: "#fff" }}>
+      <h2 style={{ fontFamily: "Georgia, serif", fontSize: 18, margin: "0 0 4px" }}>Waiting list</h2>
+      <p style={{ fontSize: 14, color: "#5B6472", margin: "0 0 12px" }}>Keep a few names ready so a default doesn't stall the round.</p>
+      <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+        <input value={nameInput} onChange={(e) => setNameInput(e.target.value)} placeholder="Name"
+          style={{ flex: 1, minWidth: 140, border: "1px solid #E4DFD3", borderRadius: 4, padding: "8px 10px", fontSize: 14 }} />
+        <input value={phoneInput} onChange={(e) => setPhoneInput(e.target.value)} placeholder="Phone (optional)"
+          style={{ flex: 1, minWidth: 140, border: "1px solid #E4DFD3", borderRadius: 4, padding: "8px 10px", fontSize: 14 }} />
+        <button onClick={addWaitlist} disabled={!nameInput.trim()}
+          style={{ padding: "8px 16px", borderRadius: 4, border: "1px solid #1B2A4A", background: "transparent", fontSize: 14, opacity: nameInput.trim() ? 1 : 0.4 }}>
+          Add to list
+        </button>
+      </div>
+      {waitlist.map((w) => <div key={w.id} style={{ fontSize: 14, padding: "2px 0" }}>{w.name}</div>)}
+      {defaulted.length > 0 && waitlist.length > 0 && (
+        <div style={{ paddingTop: 8, borderTop: "1px solid #E4DFD3", marginTop: 8 }}>
+          <p style={{ fontSize: 12, color: "#5B6472", margin: "0 0 8px" }}>Replace a defaulted member:</p>
+          {defaulted.map((d) => (
+            <div key={d.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 14, padding: "4px 0" }}>
+              <span>{d.name} (defaulted)</span>
+              <select onChange={(e) => e.target.value && promote(e.target.value, d.id)} defaultValue=""
+                style={{ border: "1px solid #E4DFD3", borderRadius: 4, padding: "4px", fontSize: 12 }}>
+                <option value="" disabled>Replace with…</option>
+                {waitlist.map((w) => <option key={w.id} value={w.id}>{w.name}</option>)}
+              </select>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RosterTable({ members, currency }) {
+  return (
+    <div style={{ border: "1px solid #E4DFD3", borderRadius: 6, padding: 16, marginBottom: 24, background: "#fff", overflowX: "auto" }}>
+      <h2 style={{ fontFamily: "Georgia, serif", fontSize: 18, margin: "0 0 12px" }}>Full roster</h2>
+      <table style={{ width: "100%", fontSize: 14 }}>
+        <thead>
+          <tr style={{ textAlign: "left", borderBottom: "1px solid #E4DFD3", color: "#5B6472" }}>
+            <th style={{ padding: "4px 12px 4px 0" }}>Slot</th>
+            <th style={{ padding: "4px 12px 4px 0" }}>Name</th>
+            <th style={{ padding: "4px 12px 4px 0" }}>Status</th>
+            <th style={{ padding: "4px 12px 4px 0" }}>Cycles</th>
+            <th style={{ padding: "4px 12px 4px 0" }}>Bonus pending</th>
+            <th style={{ padding: "4px 0" }}>Total paid in</th>
+          </tr>
+        </thead>
+        <tbody>
+          {[...members].sort((a, b) => a.slot - b.slot).map((m) => (
+            <tr key={m.id} style={{ borderBottom: "1px solid #F0EBDD" }}>
+              <td style={{ padding: "6px 12px 6px 0" }}>{m.slot}</td>
+              <td style={{ padding: "6px 12px 6px 0" }}>{m.name}{m.replaced ? ` (replaced ${m.replaced})` : ""}</td>
+              <td style={{ padding: "6px 12px 6px 0", color: m.defaulted ? "#B4432D" : "#3F7D58" }}>{m.defaulted ? "Defaulted" : "Active"}</td>
+              <td style={{ padding: "6px 12px 6px 0" }}>{m.completedCycles}</td>
+              <td style={{ padding: "6px 12px 6px 0", color: m.bonusCredit > 0 ? "#C98A2C" : "#5B6472" }}>{money(m.bonusCredit || 0, currency)}</td>
+              <td style={{ padding: "6px 0" }}>{money(m.totalPaidIn, currency)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function LedgerLog({ log }) {
+  return (
+    <div style={{ border: "1px solid #E4DFD3", borderRadius: 6, padding: 16, background: "#fff" }}>
+      <h2 style={{ fontFamily: "Georgia, serif", fontSize: 18, margin: "0 0 12px" }}>Transaction log</h2>
+      {log.length === 0 ? (
+        <p style={{ fontSize: 14, fontStyle: "italic", color: "#5B6472" }}>Nothing recorded yet.</p>
+      ) : (
+        <div style={{ fontSize: 14, maxHeight: 260, overflowY: "auto" }}>
+          {[...log].reverse().map((entry, i) => (
+            <div key={i} style={{ padding: "3px 0", color: entry.tone === "bad" ? "#B4432D" : entry.tone === "good" ? "#3F7D58" : "#1B2A4A" }}>
+              <span style={{ color: "#5B6472" }}>R{entry.round} — </span>{entry.text}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("./sw.js").catch(() => {});
+  });
+}
+</script>
+</body>
+</html>
